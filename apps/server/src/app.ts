@@ -115,14 +115,16 @@ export function createApp(options: CreateAppOptions = {}) {
       res.json({ save: null, world: null });
       return;
     }
+    const world = service.getWorld(sessionId, save.id);
     res.json({
       save: {
         id: save.id,
-        year: save.year,
-        season: save.season,
-        revision: save.revision
+        year: world.year,
+        season: world.season,
+        // 以读取修复后 world 内的 revision 为准，避免客户端继续持有修复前的旧版本
+        revision: world.revision
       },
-      world: service.getWorld(sessionId, save.id)
+      world
     });
   });
 

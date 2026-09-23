@@ -134,6 +134,88 @@ describe('closed-loop API', () => {
     expect(imported.body.year).toBe(2);
     expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   }, 30_000);
+
+  it('bumps revision when read-repairing a legacy save baseline and rejects stale commands', async () => {
+    const repairAgent = request.agent(app);
+    const created = await repairAgent.post('/api/save').expect(201);
+    const world = created.body as WorldSnapshot;
+
+    // 模拟缺少年初基线的旧档：状态行已存在，但基线列为空，revision 停在创建时的值。
+    const before = store.db
+      .prepare('SELECT revision, year_start_species_json FROM saves WHERE id = ?')
+      .get(world.saveId) as unknown as { revision: number; year_start_species_json: string };
+    expect(JSON.parse(before.year_start_species_json).length).toBeGreaterThan(0);
+    store.db
+      .prepare("UPDATE saves SET year_start_species_json = '[]', year_start_sites_json = '[]' WHERE id = ?")
+      .run(world.saveId);
+    const staleRevision = before.revision;
+
+    // GET 触发读取修复：基线被补回，且 revision 必须推进。
+    const repaired = await repairAgent.get(`/api/save/${world.saveId}/world`).expect(200);
+    const repairedWorld = repaired.body as WorldSnapshot;
+    expect(repairedWorld.revision).toBe(staleRevision + 1);
+    expect(
+      (
+        store.db
+          .prepare('SELECT revision, year_start_species_json FROM saves WHERE id = ?')
+          .get(world.saveId) as unknown as { revision: number; year_start_species_json: string }
+      ).revision
+    ).toBe(staleRevision + 1);
+
+    // 冲突客户端仍持旧版本直接提交指令，必须被 REVISION_CONFLICT 拒绝，不能落事件污染年报。
+    const rejected = await repairAgent
+      .post(`/api/save/${world.saveId}/commands`)
+      .send({
+        expectedRevision: staleRevision,
+        idempotencyKey: 'stale-client-legacy-baseline-1',
+        command: { type: 'WAIT' }
+      })
+      .expect(409);
+    expect(rejected.body.code).toBe('REVISION_CONFLICT');
+    expect(rejected.body.details.actual).toBe(staleRevision + 1);
+    expect(
+      (
+        store.db
+          .prepare('SELECT COUNT(*) AS count FROM game_events WHERE save_id = ?')
+          .get(world.saveId) as unknown as { count: number }
+      ).count
+    ).toBe(0);
+
+    // 修复在独立事务中提交：即便指令因版本冲突失败，基线仍然保留，且 revision 不回退。
+    const persisted = store.db
+      .prepare('SELECT revision, year_start_species_json FROM saves WHERE id = ?')
+      .get(world.saveId) as unknown as { revision: number; year_start_species_json: string };
+    expect(persisted.revision).toBe(staleRevision + 1);
+    expect(JSON.parse(persisted.year_start_species_json).length).toBeGreaterThan(0);
+
+    // 未先读取的客户端直接 POST：修复同样先于指令提交，旧版本指令依旧被拒。
+    store.db
+      .prepare("UPDATE saves SET year_start_species_json = '[]', year_start_sites_json = '[]' WHERE id = ?")
+      .run(world.saveId);
+    const secondStaleRevision = persisted.revision;
+    const rejectedAgain = await repairAgent
+      .post(`/api/save/${world.saveId}/commands`)
+      .send({
+        expectedRevision: secondStaleRevision,
+        idempotencyKey: 'stale-client-legacy-baseline-2',
+        command: { type: 'WAIT' }
+      })
+      .expect(409);
+    expect(rejectedAgain.body.code).toBe('REVISION_CONFLICT');
+    expect(rejectedAgain.body.details.actual).toBe(secondStaleRevision + 1);
+
+    // 客户端按 409 提示刷新到新版本后，指令可以正常提交。
+    const refreshed = await repairAgent.get(`/api/save/${world.saveId}/world`).expect(200);
+    const accepted = await repairAgent
+      .post(`/api/save/${world.saveId}/commands`)
+      .send({
+        expectedRevision: (refreshed.body as WorldSnapshot).revision,
+        idempotencyKey: 'fresh-client-after-repair-1',
+        command: { type: 'WAIT' }
+      })
+      .expect(200);
+    expect((accepted.body.world as WorldSnapshot).revision).toBe(secondStaleRevision + 2);
+  });
 });
 
 async function command(

@@ -191,12 +191,12 @@ export class GameService {
   }
 
   getWorld(sessionId: string, saveId: string): WorldSnapshot {
-    const save = this.getSaveOrThrow(saveId, sessionId);
+    const save = this.loadSave(sessionId, saveId);
     return this.buildWorld(save);
   }
 
   getJournal(sessionId: string, saveId: string, filters: { year?: number; season?: Season; siteId?: SiteId }): JournalEntry[] {
-    this.getSaveOrThrow(saveId, sessionId);
+    this.loadSave(sessionId, saveId);
     const clauses = ['save_id = ?'];
     const params: Array<string | number> = [saveId];
     if (filters.year) {
@@ -271,7 +271,7 @@ export class GameService {
   }
 
   getSpeciesDetail(sessionId: string, saveId: string, speciesId: string) {
-    const save = this.getSaveOrThrow(saveId, sessionId);
+    const save = this.loadSave(sessionId, saveId);
     const definition = SPECIES_BY_ID.get(speciesId);
     if (!definition) {
       throw new AppError('SPECIES_NOT_FOUND', '未找到该物种', 404);
@@ -327,7 +327,7 @@ export class GameService {
   }
 
   getAnnualReport(sessionId: string, saveId: string, year: number): AnnualReview {
-    this.getSaveOrThrow(saveId, sessionId);
+    this.loadSave(sessionId, saveId);
     const row = this.store.db
       .prepare('SELECT report_json FROM annual_reports WHERE save_id = ? AND year = ?')
       .get(saveId, year) as unknown as { report_json: string } | undefined;
@@ -346,6 +346,9 @@ export class GameService {
       command: GameCommand;
     }
   ) {
+    // 旧档补基线的读取修复在独立事务中完成并立即推进 revision，
+    // 保证修复不会被本次指令的冲突回滚带走，且持有旧版本的客户端必被下方版本校验拦下。
+    this.loadSave(sessionId, saveId);
     return this.store.transaction(() => {
       const save = this.getSaveOrThrow(saveId, sessionId);
       const commandHash = createHash('sha256').update(JSON.stringify(request.command)).digest('hex');
@@ -365,9 +368,13 @@ export class GameService {
       if (save.revision !== request.expectedRevision) {
         throw new AppError(
           'REVISION_CONFLICT',
-          '存档已被其他操作更新，请刷新后重试',
+          '存档基线已修复更新，请刷新获取最新版本后重试',
           409,
-          { expected: request.expectedRevision, actual: save.revision },
+          {
+            expected: request.expectedRevision,
+            actual: save.revision,
+            hint: '丢弃基于旧版本的操作，拉取最新世界快照后再提交'
+          },
           true
         );
       }
@@ -1289,22 +1296,44 @@ export class GameService {
     }
   }
 
+  /**
+   * 读取存档，并对缺少年初基线的旧档执行读取修复。
+   * 修复在独立事务中提交且必然推进 revision：冲突客户端下一次提交会收到
+   * REVISION_CONFLICT，无法再以旧版本继续写指令污染年度报告。
+   */
+  private loadSave(sessionId: string, saveId: string): SaveRecord {
+    const current = this.getSaveOrThrow(saveId, sessionId);
+    if (parseJson<unknown[]>(current.year_start_species_json, []).length > 0) {
+      return current;
+    }
+    this.backfillYearStartBaseline(saveId, sessionId);
+    return this.getSaveOrThrow(saveId, sessionId);
+  }
+
+  private backfillYearStartBaseline(saveId: string, sessionId: string): void {
+    this.store.transaction(() => {
+      const row = this.getSaveOrThrow(saveId, sessionId);
+      if (parseJson<unknown[]>(row.year_start_species_json, []).length > 0) {
+        return;
+      }
+      const speciesStates = this.getSpeciesStates(row.id, row.year);
+      const siteStates = this.getSiteStates(row.id, row.year);
+      if (speciesStates.length === 0 || siteStates.length === 0) {
+        return;
+      }
+      row.year_start_species_json = JSON.stringify(speciesStates);
+      row.year_start_sites_json = JSON.stringify(siteStates);
+      row.revision += 1;
+      this.updateSave(row);
+    });
+  }
+
   private getSaveOrThrow(saveId: string, sessionId: string): SaveRecord {
     const row = this.store.db
       .prepare('SELECT * FROM saves WHERE id = ? AND session_id = ?')
       .get(saveId, sessionId) as unknown as SaveRecord | undefined;
     if (!row) {
       throw new AppError('SAVE_NOT_FOUND', '未找到该观察档案', 404);
-    }
-
-    if (parseJson<unknown[]>(row.year_start_species_json, []).length === 0) {
-      const speciesStates = this.getSpeciesStates(row.id, row.year);
-      const siteStates = this.getSiteStates(row.id, row.year);
-      if (speciesStates.length > 0 && siteStates.length > 0) {
-        row.year_start_species_json = JSON.stringify(speciesStates);
-        row.year_start_sites_json = JSON.stringify(siteStates);
-        this.updateSave(row);
-      }
     }
     return row;
   }
