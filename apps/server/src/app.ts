@@ -110,19 +110,22 @@ export function createApp(options: CreateAppOptions = {}) {
       res.json({ save: null, world: null });
       return;
     }
-    const save = service.findSaveBySession(sessionId);
-    if (!save) {
+    const found = service.findSaveBySession(sessionId);
+    if (!found) {
       res.json({ save: null, world: null });
       return;
     }
+    // getWorld 会在读时修复旧档基线并推进 revision，save 与 world 必须共用修复后的
+    // 同一版本号，避免客户端拿到的期望版本落后于真实存档而被乐观锁拒绝。
+    const world = service.getWorld(sessionId, found.id);
     res.json({
       save: {
-        id: save.id,
-        year: save.year,
-        season: save.season,
-        revision: save.revision
+        id: world.saveId,
+        year: world.year,
+        season: world.season,
+        revision: world.revision
       },
-      world: service.getWorld(sessionId, save.id)
+      world
     });
   });
 

@@ -1297,16 +1297,48 @@ export class GameService {
       throw new AppError('SAVE_NOT_FOUND', '未找到该观察档案', 404);
     }
 
-    if (parseJson<unknown[]>(row.year_start_species_json, []).length === 0) {
-      const speciesStates = this.getSpeciesStates(row.id, row.year);
-      const siteStates = this.getSiteStates(row.id, row.year);
-      if (speciesStates.length > 0 && siteStates.length > 0) {
-        row.year_start_species_json = JSON.stringify(speciesStates);
-        row.year_start_sites_json = JSON.stringify(siteStates);
-        this.updateSave(row);
-      }
+    return this.repairYearStartBaseline(row);
+  }
+
+  /**
+   * 读时修复：为缺少年度基线的旧档回填 year_start 基线。
+   *
+   * 基线是年度报告的对比基准，回填属于改变存档权威内容的写操作，因此必须同步推进
+   * revision。否则在修复前已读取过旧版本的冲突客户端仍会带着旧 expectedRevision
+   * 通过乐观锁校验，以过期视角继续提交、污染年报。推进版本后这些客户端的下一条命令
+   * 会收到 REVISION_CONFLICT，强制其重新拉取修复后的世界状态。
+   *
+   * UPDATE 以 `year_start_species_json = '[]'` 为条件并检查变更行数，保证即使两个请求
+   * 并发修复同一份旧档，版本也只会推进一次；落败方重新读取修复后的行，拿到新版本。
+   */
+  private repairYearStartBaseline(row: SaveRecord): SaveRecord {
+    if (parseJson<unknown[]>(row.year_start_species_json, []).length > 0) {
+      return row;
     }
-    return row;
+    const speciesStates = this.getSpeciesStates(row.id, row.year);
+    const siteStates = this.getSiteStates(row.id, row.year);
+    if (speciesStates.length === 0 || siteStates.length === 0) {
+      return row;
+    }
+
+    const result = this.store.db
+      .prepare(
+        `UPDATE saves
+         SET year_start_species_json = ?, year_start_sites_json = ?, revision = revision + 1, updated_at = ?
+         WHERE id = ? AND year_start_species_json = '[]'`
+      )
+      .run(
+        JSON.stringify(speciesStates),
+        JSON.stringify(siteStates),
+        new Date().toISOString(),
+        row.id
+      ) as unknown as { changes: number };
+
+    const repaired =
+      result.changes > 0
+        ? ({ ...row, year_start_species_json: JSON.stringify(speciesStates), year_start_sites_json: JSON.stringify(siteStates), revision: row.revision + 1 })
+        : (this.store.db.prepare('SELECT * FROM saves WHERE id = ?').get(row.id) as unknown as SaveRecord);
+    return repaired;
   }
 
   private updateSave(save: SaveRecord): void {

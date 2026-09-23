@@ -134,6 +134,69 @@ describe('closed-loop API', () => {
     expect(imported.body.year).toBe(2);
     expect(store.db.prepare('PRAGMA foreign_key_check').all()).toEqual([]);
   }, 30_000);
+
+  it('read-repair of a legacy baseline bumps revision and rejects stale clients', async () => {
+    const repairAgent = request.agent(app);
+    const created = await repairAgent.post('/api/save').expect(201);
+    const world = created.body as WorldSnapshot;
+    const saveId = world.saveId;
+
+    // 模拟旧档：年度基线缺失（'[]'），但当年物种/区域状态已初始化。
+    const staleRevision = Number(
+      (
+        store.db.prepare('SELECT revision AS revision FROM saves WHERE id = ?').get(saveId) as unknown as {
+          revision: number;
+        }
+      ).revision
+    );
+    store.db
+      .prepare("UPDATE saves SET year_start_species_json = '[]', year_start_sites_json = '[]' WHERE id = ?")
+      .run(saveId);
+
+    // 读取修复：基线被回填且版本被推进。
+    await repairAgent.get(`/api/save/${saveId}/world`).expect(200);
+
+    const repairedRow = store.db
+      .prepare('SELECT revision AS revision, year_start_species_json AS baseline FROM saves WHERE id = ?')
+      .get(saveId) as unknown as { revision: number; baseline: string };
+    expect(JSON.parse(repairedRow.baseline).length).toBeGreaterThan(0);
+    expect(Number(repairedRow.revision)).toBe(staleRevision + 1);
+
+    // /current 的 save 与 world 必须返回同一个（修复后的）版本号。
+    const current = await repairAgent.get('/api/save/current').expect(200);
+    expect(current.body.save.revision).toBe(staleRevision + 1);
+    expect(current.body.world.revision).toBe(staleRevision + 1);
+
+    // 重复读取不应重复推进版本。
+    await repairAgent.get(`/api/save/${saveId}/world`).expect(200);
+    const again = store.db.prepare('SELECT revision AS revision FROM saves WHERE id = ?').get(saveId) as unknown as {
+      revision: number;
+    };
+    expect(Number(again.revision)).toBe(staleRevision + 1);
+
+    // 持旧版本的客户端继续提交必须被乐观锁拒绝，不能以旧版本污染年报。
+    const staleResponse = await repairAgent
+      .post(`/api/save/${saveId}/commands`)
+      .send({
+        expectedRevision: staleRevision,
+        idempotencyKey: 'stale-client-must-conflict-001',
+        command: { type: 'WAIT' }
+      })
+      .expect(409);
+    expect(staleResponse.body.code).toBe('REVISION_CONFLICT');
+    expect(staleResponse.body.details.actual).toBe(staleRevision + 1);
+
+    // 冲突客户端刷新到新版本后即可正常提交，且版本在修复基础上继续递增。
+    const refreshed = await repairAgent
+      .post(`/api/save/${saveId}/commands`)
+      .send({
+        expectedRevision: staleRevision + 1,
+        idempotencyKey: 'refreshed-client-succeeds-001',
+        command: { type: 'WAIT' }
+      })
+      .expect(200);
+    expect(refreshed.body.world.revision).toBe(staleRevision + 2);
+  });
 });
 
 async function command(
